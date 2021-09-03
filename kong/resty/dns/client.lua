@@ -749,6 +749,7 @@ local function executeQuery(premature, item)
   -- 2) release all waiting threads
   item.semaphore:post(math_max(item.semaphore:count() * -1, 1))
   item.semaphore = nil
+  ngx.sleep(0)
 end
 
 
