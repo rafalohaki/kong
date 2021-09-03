@@ -575,7 +575,7 @@ describe("[DNS client cache]", function()
     it("entries from hosts file ignores validTtl overrides, Kong/kong #7444", function()
       ngx.sleep(0.2) -- must be > validTtl + staleTtl
 
-      record = client.getcache():get("1:myname.lan")
+      local record = client.getcache():get("1:myname.lan")
       assert.equal("127.0.0.1", record[1].address)
     end)
   end)
