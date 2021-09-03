@@ -20,7 +20,7 @@
 -- @license Apache 2.0
 
 local _
-local utils = require("resty.dns.utils")
+local utils = require("kong.resty.dns.utils")
 local fileexists = require("pl.path").exists
 local semaphore = require("ngx.semaphore").new
 local lrucache = require("resty.lrucache")
@@ -1566,4 +1566,3 @@ if package.loaded.busted then
 end
 
 return _M
-

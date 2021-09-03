@@ -13,7 +13,7 @@ __DATA__
 --- config
     location = /t {
         access_by_lua_block {
-            local client = require("resty.dns.client")
+            local client = require("kong.resty.dns.client")
             assert(client.init())
             local host = "localhost"
             local typ = client.TYPE_A
@@ -41,7 +41,7 @@ API disabled in the context of init_worker_by_lua
 --- http_config eval
 qq {
     init_worker_by_lua_block {
-        local client = require("resty.dns.client")
+        local client = require("kong.resty.dns.client")
         assert(client.init())
         local host = "konghq.com"
         local typ = client.TYPE_A

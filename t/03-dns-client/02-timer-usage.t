@@ -13,7 +13,7 @@ __DATA__
 --- http_config eval
 qq {
     init_worker_by_lua_block {
-        local client = require("resty.dns.client")
+        local client = require("kong.resty.dns.client")
         assert(client.init({
             nameservers = { "8.8.8.8" },
             hosts = {}, -- empty tables to parse to prevent defaulting to /etc/hosts
@@ -38,7 +38,7 @@ qq {
 --- config
     location = /t {
         access_by_lua_block {
-            local client = require("resty.dns.client")
+            local client = require("kong.resty.dns.client")
             assert(client.init())
             local host = "httpbin.org"
             local typ = client.TYPE_A

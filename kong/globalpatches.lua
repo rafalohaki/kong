@@ -417,6 +417,6 @@ return function(options)
     end
 
     -- STEP 5: load code that should be using the patched versions, if any (because of dependency chain)
-    toip = require("resty.dns.client").toip  -- this will load utils and penlight modules for example
+    toip = require("kong.resty.dns.client").toip  -- this will load utils and penlight modules for example
   end
 end

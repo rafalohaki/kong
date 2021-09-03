@@ -10,6 +10,8 @@ else
   sleep = socket.sleep
 end
 
+package.loaded["kong.resty.dns.client"] = nil
+
 -- simple debug function
 local dump = function(...)
   print(require("pl.pretty").write({...}))
@@ -20,7 +22,7 @@ describe("[DNS client cache]", function()
   local client, resolver, query_func
 
   before_each(function()
-    client = require("resty.dns.client")
+    client = require("kong.resty.dns.client")
     resolver = require("resty.dns.resolver")
 
     -- you can replace this `query_func` upvalue to spy on resolver query calls.
@@ -48,7 +50,7 @@ describe("[DNS client cache]", function()
   end)
 
   after_each(function()
-    package.loaded["resty.dns.client"] = nil
+    package.loaded["kong.resty.dns.client"] = nil
     package.loaded["resty.dns.resolver"] = nil
     client = nil
     resolver = nil
