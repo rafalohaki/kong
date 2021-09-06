@@ -1,0 +1,2099 @@
+
+local client -- forward declaration
+local dns_utils = require "resty.dns.utils"
+local helpers = require "spec.helpers.dns"
+local dnsSRV = function(...) return helpers.dnsSRV(client, ...) end
+local dnsA = function(...) return helpers.dnsA(client, ...) end
+local dnsExpire = helpers.dnsExpire
+
+local mocker = require "spec.fixtures.mocker"
+local utils = require "kong.tools.utils"
+
+local ws_id = utils.uuid()
+
+local function table_merge(a, b, ...)
+  if not b then
+    return a
+  end
+
+  for k, v in pairs(b) do
+    a[k] = v
+  end
+  return table_merge(a, ...)
+end
+
+
+local unset_register = {}
+local function setup_block()
+  local function mock_cache(cache_table, limit)
+    return {
+      safe_set = function(self, k, v)
+        if limit then
+          local n = 0
+          for _, _ in pairs(cache_table) do
+            n = n + 1
+          end
+          if n >= limit then
+            return nil, "no memory"
+          end
+        end
+        cache_table[k] = v
+        return true
+      end,
+      get = function(self, k, _, fn, arg)
+        if cache_table[k] == nil then
+          cache_table[k] = fn(arg)
+        end
+        return cache_table[k]
+      end,
+    }
+  end
+
+  local cache_table = {}
+  local function register_unsettter(f)
+    table.insert(unset_register, f)
+  end
+
+  mocker.setup(register_unsettter, {
+    kong = {
+      configuration = {
+        --worker_consistency = consistency,
+        worker_state_update_frequency = 0.1,
+      },
+      core_cache = mock_cache(cache_table),
+    },
+    ngx = {
+      ctx = {
+        --workspace = ws_id,
+      }
+    }
+  })
+end
+
+local function unsetup_block()
+  for _, f in ipairs(unset_register) do
+    f()
+  end
+end
+
+
+local balancer
+local balancers, upstreams, targets
+
+local upstream_index = 0
+
+local function new_balancer(algorithm)
+  upstream_index = upstream_index + 1
+  local upname="upstream_" .. upstream_index
+  local hc_defaults = {
+    active = {
+      timeout = 1,
+      concurrency = 10,
+      http_path = "/",
+      healthy = {
+        interval = 0,  -- 0 = probing disabled by default
+        http_statuses = { 200, 302 },
+        successes = 0, -- 0 = disabled by default
+      },
+      unhealthy = {
+        interval = 0, -- 0 = probing disabled by default
+        http_statuses = { 429, 404,
+                          500, 501, 502, 503, 504, 505 },
+        tcp_failures = 0,  -- 0 = disabled by default
+        timeouts = 0,      -- 0 = disabled by default
+        http_failures = 0, -- 0 = disabled by default
+      },
+    },
+    passive = {
+      healthy = {
+        http_statuses = { 200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+                          300, 301, 302, 303, 304, 305, 306, 307, 308 },
+        successes = 0,
+      },
+      unhealthy = {
+        http_statuses = { 429, 500, 503 },
+        tcp_failures = 0,  -- 0 = circuit-breaker disabled by default
+        timeouts = 0,      -- 0 = circuit-breaker disabled by default
+        http_failures = 0, -- 0 = circuit-breaker disabled by default
+      },
+    },
+  }
+  local my_upstream = { id=upname, name=upname, ws_id=ws_id, slots=10, healthchecks=hc_defaults, algorithm=algorithm }
+  local b = (balancers.create_balancer(my_upstream, true))
+
+  return b
+end
+
+local function add_target(b, name, port, weight)
+
+  -- adding again changes weight
+  for _, prev_target in ipairs(b.targets) do
+    if prev_target.name == name and prev_target.port == port then
+      local entry = {port = port}
+      for _, addr in ipairs(prev_target.addresses) do
+        entry.address = addr.ip
+        b:changeWeight(prev_target, entry, weight)
+      end
+      prev_target.weight = weight
+      return prev_target
+    end
+  end
+
+  -- add new
+  local target = { name=name, port=port , weight=weight }
+  local upname = b.upstream and b.upstream.name or b.upstream_id
+  local t = table_merge({
+    upstream = upname,
+    balancer = b,
+    name = target.name,
+    nameType = dns_utils.hostnameType(target.name),
+    addresses = {},
+    port = 8000,
+    weight = 100,
+    totalWeight = 0,
+    unavailableWeight = 0,
+  }, target)
+
+  table.insert(b.targets, t)
+  targets.resolve_targets(b.targets)
+
+  return t
+end
+
+
+for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-robin" } do
+
+  describe("[" .. algorithm .. "]", function()
+
+    local snapshot
+
+    setup(function()
+      _G.package.loaded["resty.dns.client"] = nil -- make sure module is reloaded
+      _G.package.loaded["kong.runloop.balancer.targets"] = nil -- make sure module is reloaded
+      _G.package.loaded["kong.runloop.balancer.upstreams"] = nil -- make sure module is reloaded
+      _G.package.loaded["kong.runloop.balancer.targets"] = nil -- make sure module is reloaded
+      _G.package.loaded["kong.runloop.balancer"] = nil -- make sure module is reloaded
+
+      singletons = require "kong.singletons"
+      singletons.worker_events = require "resty.worker.events"
+      singletons.db = {}
+
+      client = require "resty.dns.client"
+      targets = require "kong.runloop.balancer.targets"
+      upstreams = require "kong.runloop.balancer.upstreams"
+      balancers = require "kong.runloop.balancer.balancers"
+      balancer = require "kong.runloop.balancer"
+      local healthcheckers = require "kong.runloop.balancer.healthcheckers"
+      healthcheckers.init()
+      balancers.init()
+      targets.start_resolve_timer()
+
+      singletons.worker_events.configure({
+        shm = "kong_process_events", -- defined by "lua_shared_dict"
+        timeout = 5,            -- life time of event data in shm
+        interval = 1,           -- poll interval (seconds)
+
+        wait_interval = 0.010,  -- wait before retry fetching event data
+        wait_max = 0.5,         -- max wait time before discarding event
+      })
+
+      local function empty_each()
+        return function() end
+      end
+
+      singletons.db = {
+        targets = {
+          each = empty_each,
+          select_by_upstream_raw = function(self, upstream_pk)
+            local upstream_id = upstream_pk.id
+            local res, len = {}, 0
+            for tgt in self:each() do
+              if tgt.upstream.id == upstream_id then
+                tgt.order = string.format("%d:%s", tgt.created_at * 1000, tgt.id)
+                len = len + 1
+                res[len] = tgt
+              end
+            end
+
+            table.sort(res, function(a, b) return a.order < b.order end)
+            return res
+          end
+        },
+        upstreams = {
+          each = empty_each,
+          select = function() end,
+        },
+      }
+
+      singletons.core_cache = {
+        _cache = {},
+        get = function(self, key, _, loader, arg)
+          local v = self._cache[key]
+          if v == nil then
+            v = loader(arg)
+            self._cache[key] = v
+          end
+          return v
+        end,
+        invalidate_local = function(self, key)
+          self._cache[key] = nil
+        end
+      }
+
+    end)
+
+
+    before_each(function()
+      setup_block()
+      assert(client.init {
+        hosts = {},
+        resolvConf = {
+          "nameserver 8.8.8.8"
+        },
+      })
+      snapshot = assert:snapshot()
+      assert:set_parameter("TableFormatLevel", 10)
+    end)
+
+
+    after_each(function()
+      snapshot:revert()  -- undo any spying/stubbing etc.
+      unsetup_block()
+      collectgarbage()
+      collectgarbage()
+    end)
+
+
+    describe("health:", function()
+
+      local b
+
+      before_each(function()
+        --b = balancer_module.new({
+        --  dns = client,
+        --  healthThreshold = 50,
+        --})
+        b = new_balancer(algorithm)
+        b.healthThreshold = 50
+      end)
+
+      after_each(function()
+        b = nil
+      end)
+
+      it("empty balancer is unhealthy", function()
+        assert.is_false((b:getStatus().healthy))
+      end)
+
+      it("adding first address marks healthy", function()
+        assert.is_false(b:getStatus().healthy)
+        add_target(b, "127.0.0.1", 8000, 100)
+        assert.is_true(b:getStatus().healthy)
+      end)
+
+      it("removing last address marks unhealthy", function()
+        pending("we don't remove targets from balancer")
+        assert.is_false(b:getStatus().healthy)
+        add_target(b, "127.0.0.1", 8000, 100)
+        assert.is_true(b:getStatus().healthy)
+        remove_target(b, "127.0.0.1", 8000)
+        assert.is_false(b:getStatus().healthy)
+      end)
+
+      it("dropping below the health threshold marks unhealthy", function()
+        assert.is_false(b:getStatus().healthy)
+        add_target(b, "127.0.0.1", 8000, 100)
+        add_target(b, "127.0.0.2", 8000, 100)
+        add_target(b, "127.0.0.3", 8000, 100)
+        assert.is_true(b:getStatus().healthy)
+        --b:setAddressStatus(false, "127.0.0.2", 8000)
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
+        assert.is_true(b:getStatus().healthy)
+        --b:setAddressStatus(false, "127.0.0.3", 8000)
+        b:setAddressStatus(b:findAddress("127.0.0.3", 8000, "127.0.0.3"), false)
+        assert.is_false(b:getStatus().healthy)
+      end)
+
+      it("rising above the health threshold marks healthy", function()
+        assert.is_false(b:getStatus().healthy)
+        add_target(b, "127.0.0.1", 8000, 100)
+        add_target(b, "127.0.0.2", 8000, 100)
+        add_target(b, "127.0.0.3", 8000, 100)
+        --b:setAddressStatus(false, "127.0.0.2", 8000)
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
+        --b:setAddressStatus(false, "127.0.0.3", 8000)
+        b:setAddressStatus(b:findAddress("127.0.0.3", 8000, "127.0.0.3"), false)
+        assert.is_false(b:getStatus().healthy)
+        --b:setAddressStatus(true, "127.0.0.2", 8000)
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), true)
+        assert.is_true(b:getStatus().healthy)
+      end)
+
+    end)
+
+
+
+    describe("weights:", function()
+
+      local b
+
+      before_each(function()
+        --b = balancer_module.new({
+        --  dns = client,
+        --})
+        b = new_balancer(algorithm)
+        b.getPeer = function(self)
+          -- we do not really need to get a peer, just touch all addresses to
+          -- potentially force DNS renewals
+          --for _, addr in ipairs(self.addresses) do
+          --  addr:getPeer()
+          --end
+          targets.resolve_targets(self.targets)
+        end
+        add_target(b, "127.0.0.1", 8000, 100)  -- add 1 initial host
+      end)
+
+      after_each(function()
+        b = nil
+      end)
+
+
+
+      describe("(A)", function()
+
+        it("adding a host",function()
+          dnsA({
+            { name = "arecord.tst", address = "1.2.3.4" },
+            { name = "arecord.tst", address = "5.6.7.8" },
+          })
+
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 100,
+              available = 100,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          add_target(b, "arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 150,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("removing a host",function()
+          pending("we don't remove targets from balancer")
+          dnsA({
+            { name = "arecord.tst", address = "1.2.3.4" },
+            { name = "arecord.tst", address = "5.6.7.8" },
+          })
+
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 100,
+              available = 100,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          add_target(b, "arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 150,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          b:removeHost("arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 100,
+              available = 100,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+        end)
+
+        it("switching address availability",function()
+          dnsA({
+            { name = "arecord.tst", address = "1.2.3.4" },
+            { name = "arecord.tst", address = "5.6.7.8" },
+          })
+
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 100,
+              available = 100,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          add_target(b, "arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 150,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- switch to unavailable
+          --assert(b:setAddressStatus(false, "1.2.3.4", 8001, "arecord.tst"))
+          assert(b:setAddressStatus(b:findAddress("1.2.3.4", 8001, "arecord.tst"), false))
+          --add_target(b, "arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 125,
+              unavailable = 25
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 25,
+                  unavailable = 25
+                },
+                addresses = {
+                  {
+                    healthy = false,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- switch to available
+          assert(b:setAddressStatus(b:findAddress("1.2.3.4", 8001, "arecord.tst"), true))
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 150,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("changing weight of an available address",function()
+          dnsA({
+            { name = "arecord.tst", address = "1.2.3.4" },
+            { name = "arecord.tst", address = "5.6.7.8" },
+          })
+
+          add_target(b, "arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 150,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          add_target(b, "arecord.tst", 8001, 50) -- adding again changes weight
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 200,
+              available = 200,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 50,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 50
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 50
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("changing weight of an unavailable address",function()
+          dnsA({
+            { name = "arecord.tst", address = "1.2.3.4" },
+            { name = "arecord.tst", address = "5.6.7.8" },
+          })
+
+          add_target(b, "arecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 150,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- switch to unavailable
+          assert(b:setAddressStatus(b:findAddress("1.2.3.4", 8001, "arecord.tst"), false))
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 150,
+              available = 125,
+              unavailable = 25
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 25,
+                weight = {
+                  total = 50,
+                  available = 25,
+                  unavailable = 25
+                },
+                addresses = {
+                  {
+                    healthy = false,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 25
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 25
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          add_target(b, "arecord.tst", 8001, 50) -- adding again changes weight
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 200,
+              available = 150,
+              unavailable = 50
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "arecord.tst",
+                port = 8001,
+                dns = "A",
+                nodeWeight = 50,
+                weight = {
+                  total = 100,
+                  available = 50,
+                  unavailable = 50
+                },
+                addresses = {
+                  {
+                    healthy = false,
+                    ip = "1.2.3.4",
+                    port = 8001,
+                    weight = 50
+                  },
+                  {
+                    healthy = true,
+                    ip = "5.6.7.8",
+                    port = 8001,
+                    weight = 50
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+      end)
+
+      describe("(SRV)", function()
+
+        it("adding a host",function()
+          dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 10 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 10 },
+          })
+
+          add_target(b, "srvrecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 120,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("removing a host",function()
+          pending("we don't remove targets from balancer")
+          dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 10 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 10 },
+          })
+
+          add_target(b, "srvrecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 120,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          b:removeHost("srvrecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 100,
+              available = 100,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("switching address availability",function()
+          dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 10 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 10 },
+          })
+
+          add_target(b, "srvrecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 120,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- switch to unavailable
+          assert(b:setAddressStatus(b:findAddress("1.1.1.1", 9000, "srvrecord.tst"), false))
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 110,
+              unavailable = 10
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 10,
+                  unavailable = 10
+                },
+                addresses = {
+                  {
+                    healthy = false,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- switch to available
+          assert(b:setAddressStatus(b:findAddress("1.1.1.1", 9000, "srvrecord.tst"), true))
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 120,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("changing weight of an available address (dns update)",function()
+          local record = dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 10 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 10 },
+          })
+
+          add_target(b, "srvrecord.tst", 8001, 10)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 120,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 10,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          dnsExpire(record)
+          dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 20 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 20 },
+          })
+          b:getPeer()  -- touch all adresses to force dns renewal
+          add_target(b, "srvrecord.tst", 8001, 99) -- add again to update nodeWeight
+
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 140,
+              available = 140,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 99,
+                weight = {
+                  total = 40,
+                  available = 40,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 20
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 20
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+        it("changing weight of an unavailable address (dns update)",function()
+          local record = dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 10 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 10 },
+          })
+
+          add_target(b, "srvrecord.tst", 8001, 25)
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 120,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- switch to unavailable
+          assert(b:setAddressStatus(b:findAddress("2.2.2.2", 9001, "srvrecord.tst"), false))
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 120,
+              available = 110,
+              unavailable = 10
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 25,
+                weight = {
+                  total = 20,
+                  available = 10,
+                  unavailable = 10
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = false,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+
+          -- update weight, through dns renewal
+          dnsExpire(record)
+          dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 20 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 20 },
+          })
+          b:getPeer()  -- touch all adresses to force dns renewal
+          add_target(b, "srvrecord.tst", 8001, 99) -- add again to update nodeWeight
+
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 140,
+              available = 120,
+              unavailable = 20
+            },
+            hosts = {
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "srvrecord.tst",
+                port = 8001,
+                dns = "SRV",
+                nodeWeight = 99,
+                weight = {
+                  total = 40,
+                  available = 20,
+                  unavailable = 20
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 20
+                  },
+                  {
+                    healthy = false,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 20
+                  },
+                },
+              },
+            },
+          }, b:getStatus())
+        end)
+
+      end)
+
+    end)
+
+
+
+    describe("getpeer()", function()
+
+      local b
+
+      before_each(function()
+        --b = balancer_module.new({
+        --  dns = client,
+        --  healthThreshold = 50,
+        --  useSRVname = false,
+        --})
+        b = new_balancer(algorithm)
+        b.healthThreshold = 50
+        b.useSRVname = false
+      end)
+
+      after_each(function()
+        b = nil
+      end)
+
+
+      it("returns expected results/types when using SRV with IP", function()
+        dnsSRV({
+          { name = "konghq.com", target = "1.1.1.1", port = 2, weight = 3 },
+        })
+        add_target(b, "konghq.com", 8000, 50)
+        local ip, port, hostname, handle = b:getPeer(nil, nil, "xxx")
+        assert.equal("1.1.1.1", ip)
+        assert.equal(2, port)
+        assert.equal("konghq.com", hostname)
+        --assert.equal("userdata", type(handle.__udata))
+        assert.not_nil(handle)
+      end)
+
+
+      it("returns expected results/types when using SRV with name ('useSRVname=false')", function()
+        dnsA({
+          { name = "getkong.org", address = "1.2.3.4" },
+        })
+        dnsSRV({
+          { name = "konghq.com", target = "getkong.org", port = 2, weight = 3 },
+        })
+        add_target(b, "konghq.com", 8000, 50)
+        local ip, port, hostname, handle = b:getPeer(nil, nil, "xxx")
+        assert.equal("1.2.3.4", ip)
+        assert.equal(2, port)
+        assert.equal("konghq.com", hostname)
+        --assert.equal("userdata", type(handle.__udata))
+        assert.not_nil(handle)
+      end)
+
+
+      it("returns expected results/types when using SRV with name ('useSRVname=true')", function()
+        b.useSRVname = true -- override setting specified when creating
+
+        dnsA({
+          { name = "getkong.org", address = "1.2.3.4" },
+        })
+        dnsSRV({
+          { name = "konghq.com", target = "getkong.org", port = 2, weight = 3 },
+        })
+        add_target(b, "konghq.com", 8000, 50)
+        local ip, port, hostname, handle = b:getPeer(nil, nil, "xxx")
+        assert.equal("1.2.3.4", ip)
+        assert.equal(2, port)
+        assert.equal("getkong.org", hostname)
+        --assert.equal("userdata", type(handle.__udata))
+        assert.not_nil(handle)
+      end)
+
+
+      it("returns expected results/types when using A", function()
+        dnsA({
+          { name = "getkong.org", address = "1.2.3.4" },
+        })
+        add_target(b, "getkong.org", 8000, 50)
+        local ip, port, hostname, handle = b:getPeer(nil, nil, "xxx")
+        assert.equal("1.2.3.4", ip)
+        assert.equal(8000, port)
+        assert.equal("getkong.org", hostname)
+        --assert.equal("userdata", type(handle.__udata))
+        assert.not_nil(handle)
+      end)
+
+
+      it("returns expected results/types when using IPv4", function()
+        add_target(b, "4.3.2.1", 8000, 50)
+        local ip, port, hostname, handle = b:getPeer(nil, nil, "xxx")
+        assert.equal("4.3.2.1", ip)
+        assert.equal(8000, port)
+        assert.equal(nil, hostname)
+        --assert.equal("userdata", type(handle.__udata))
+        assert.not_nil(handle)
+      end)
+
+
+      it("returns expected results/types when using IPv6", function()
+        add_target(b, "::1", 8000, 50)
+        local ip, port, hostname, handle = b:getPeer(nil, nil, "xxx")
+        assert.equal("[::1]", ip)
+        assert.equal(8000, port)
+        assert.equal(nil, hostname)
+        --assert.equal("userdata", type(handle.__udata))
+        assert.not_nil(handle)
+      end)
+
+
+      it("fails when there are no addresses added", function()
+        assert.same({
+            nil, "Balancer is unhealthy", nil, nil,
+          }, {
+            b:getPeer(nil, nil, "xxx")
+          }
+        )
+      end)
+
+
+      it("fails when all addresses are unhealthy", function()
+        add_target(b, "127.0.0.1", 8000, 100)
+        add_target(b, "127.0.0.2", 8000, 100)
+        add_target(b, "127.0.0.3", 8000, 100)
+        b:setAddressStatus(b:findAddress("127.0.0.1", 8000, "127.0.0.1"), false)
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
+        b:setAddressStatus(b:findAddress("127.0.0.3", 8000, "127.0.0.3"), false)
+        assert.same({
+            nil, "Balancer is unhealthy", nil, nil,
+          }, {
+            b:getPeer(nil, nil, "xxx")
+          }
+        )
+      end)
+
+
+      it("fails when balancer switches to unhealthy", function()
+        add_target(b, "127.0.0.1", 8000, 100)
+        add_target(b, "127.0.0.2", 8000, 100)
+        add_target(b, "127.0.0.3", 8000, 100)
+        assert.not_nil(b:getPeer(nil, nil, "xxx"))
+
+        b:setAddressStatus(b:findAddress("127.0.0.1", 8000, "127.0.0.1"), false)
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
+        assert.same({
+            nil, "Balancer is unhealthy", nil, nil,
+          }, {
+            b:getPeer(nil, nil, "xxx")
+          }
+        )
+      end)
+
+
+      it("recovers when balancer switches to healthy", function()
+        add_target(b, "127.0.0.1", 8000, 100)
+        add_target(b, "127.0.0.2", 8000, 100)
+        add_target(b, "127.0.0.3", 8000, 100)
+        assert.not_nil(b:getPeer(nil, nil, "xxx"))
+
+        b:setAddressStatus(b:findAddress("127.0.0.1", 8000, "127.0.0.1"), false)
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
+        assert.same({
+            nil, "Balancer is unhealthy", nil, nil,
+          }, {
+            b:getPeer(nil, nil, "xxx")
+          }
+        )
+
+        b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), true)
+        assert.not_nil(b:getPeer(nil, nil, "xxx"))
+      end)
+
+
+      it("recovers when dns entries are replaced by healthy ones", function()
+        local record = dnsA({
+          { name = "getkong.org", address = "1.2.3.4" },
+        })
+        add_target(b, "getkong.org", 8000, 50)
+        assert.not_nil(b:getPeer(nil, nil, "xxx"))
+
+        -- mark it as unhealthy
+        assert(b:setAddressStatus(b:findAddress("1.2.3.4", 8000, "getkong.org", false)))
+        assert.same({
+            nil, "Balancer is unhealthy", nil, nil,
+          }, {
+            b:getPeer(nil, nil, "xxx")
+          }
+        )
+
+        -- expire DNS and add a new backend IP
+        -- balancer should now recover since a new healthy backend is available
+        record.expire = 0
+        dnsA({
+          { name = "getkong.org", address = "5.6.7.8" },
+        })
+        targets.resolve_targets(b.targets)
+
+        local timeout = ngx.now() + 5   -- we'll try for 5 seconds
+        while true do
+          assert(ngx.now() < timeout, "timeout")
+
+          local ip = b:getPeer(nil, nil, "xxx")
+          if ip == "5.6.7.8" then
+            break  -- expected result, success!
+          end
+
+          ngx.sleep(0.1)  -- wait a bit before retrying
+        end
+
+      end)
+
+    end)
+
+
+
+    describe("status:", function()
+
+      local b
+
+      before_each(function()
+        --b = balancer_module.new({
+        --  dns = client,
+        --})
+        b = new_balancer(algorithm)
+      end)
+
+      after_each(function()
+        b = nil
+      end)
+
+
+
+      describe("reports DNS source", function()
+
+        it("status report",function()
+          add_target(b, "127.0.0.1", 8000, 100)
+          add_target(b, "0::1", 8080, 50)
+          dnsSRV({
+            { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 10 },
+            { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 10 },
+          })
+          add_target(b, "srvrecord.tst", 1234, 9999)
+          dnsA({
+            { name = "getkong.org", address = "5.6.7.8", ttl = 0 },
+          })
+          add_target(b, "getkong.org", 5678, 1000)
+          add_target(b, "notachanceinhell.this.name.exists.konghq.com", 4321, 100)
+
+          assert.same({
+            healthy = true,
+            weight = {
+              total = 1170,
+              available = 1170,
+              unavailable = 0
+            },
+            hosts = {
+              {
+                host = "0::1",
+                port = 8080,
+                dns = "AAAA",
+                nodeWeight = 50,
+                weight = {
+                  total = 50,
+                  available = 50,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "[0::1]",
+                    port = 8080,
+                    weight = 50
+                  },
+                },
+              },
+              {
+                host = "127.0.0.1",
+                port = 8000,
+                dns = "A",
+                nodeWeight = 100,
+                weight = {
+                  total = 100,
+                  available = 100,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "127.0.0.1",
+                    port = 8000,
+                    weight = 100
+                  },
+                },
+              },
+              {
+                host = "getkong.org",
+                port = 5678,
+                dns = "ttl=0, virtual SRV",
+                nodeWeight = 1000,
+                weight = {
+                  total = 1000,
+                  available = 1000,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "getkong.org",
+                    port = 5678,
+                    weight = 1000
+                  },
+                },
+              },
+              {
+                host = "notachanceinhell.this.name.exists.konghq.com",
+                port = 4321,
+                dns = "dns server error: 3 name error",
+                nodeWeight = 100,
+                weight = {
+                  total = 0,
+                  available = 0,
+                  unavailable = 0
+                },
+                addresses = {},
+              },
+              {
+                host = "srvrecord.tst",
+                port = 1234,
+                dns = "SRV",
+                nodeWeight = 9999,
+                weight = {
+                  total = 20,
+                  available = 20,
+                  unavailable = 0
+                },
+                addresses = {
+                  {
+                    healthy = true,
+                    ip = "1.1.1.1",
+                    port = 9000,
+                    weight = 10
+                  },
+                  {
+                    healthy = true,
+                    ip = "2.2.2.2",
+                    port = 9001,
+                    weight = 10
+                  },
+                },
+              },
+
+            },
+          }, b:getStatus())
+        end)
+
+      end)
+
+    end)
+
+  end)
+
+end
