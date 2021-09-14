@@ -11,17 +11,6 @@ local utils = require "kong.tools.utils"
 
 local ws_id = utils.uuid()
 
-local function table_merge(a, b, ...)
-  if not b then
-    return a
-  end
-
-  for k, v in pairs(b) do
-    a[k] = v
-  end
-  return table_merge(a, ...)
-end
-
 
 local unset_register = {}
 local function setup_block()
@@ -64,7 +53,7 @@ local function setup_block()
     },
     ngx = {
       ctx = {
-        --workspace = ws_id,
+        workspace = ws_id,
       }
     }
   })
@@ -140,24 +129,23 @@ local function add_target(b, name, port, weight)
   end
 
   -- add new
-  local target = { name=name, port=port , weight=weight }
   local upname = b.upstream and b.upstream.name or b.upstream_id
-  local t = table_merge({
-    upstream = upname,
+  local target = {
+    upstream = name or upname,
     balancer = b,
-    name = target.name,
-    nameType = dns_utils.hostnameType(target.name),
+    name = name,
+    nameType = dns_utils.hostnameType(name),
     addresses = {},
-    port = 8000,
-    weight = 100,
+    port = port or 8000,
+    weight = weight or 100,
     totalWeight = 0,
     unavailableWeight = 0,
-  }, target)
+  }
 
-  table.insert(b.targets, t)
+  table.insert(b.targets, target)
   targets.resolve_targets(b.targets)
 
-  return t
+  return target
 end
 
 
@@ -204,19 +192,8 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
       singletons.db = {
         targets = {
           each = empty_each,
-          select_by_upstream_raw = function(self, upstream_pk)
-            local upstream_id = upstream_pk.id
-            local res, len = {}, 0
-            for tgt in self:each() do
-              if tgt.upstream.id == upstream_id then
-                tgt.order = string.format("%d:%s", tgt.created_at * 1000, tgt.id)
-                len = len + 1
-                res[len] = tgt
-              end
-            end
-
-            table.sort(res, function(a, b) return a.order < b.order end)
-            return res
+          select_by_upstream_raw = function()
+            return {}
           end
         },
         upstreams = {
@@ -306,10 +283,8 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         add_target(b, "127.0.0.2", 8000, 100)
         add_target(b, "127.0.0.3", 8000, 100)
         assert.is_true(b:getStatus().healthy)
-        --b:setAddressStatus(false, "127.0.0.2", 8000)
         b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
         assert.is_true(b:getStatus().healthy)
-        --b:setAddressStatus(false, "127.0.0.3", 8000)
         b:setAddressStatus(b:findAddress("127.0.0.3", 8000, "127.0.0.3"), false)
         assert.is_false(b:getStatus().healthy)
       end)
@@ -319,12 +294,9 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         add_target(b, "127.0.0.1", 8000, 100)
         add_target(b, "127.0.0.2", 8000, 100)
         add_target(b, "127.0.0.3", 8000, 100)
-        --b:setAddressStatus(false, "127.0.0.2", 8000)
         b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), false)
-        --b:setAddressStatus(false, "127.0.0.3", 8000)
         b:setAddressStatus(b:findAddress("127.0.0.3", 8000, "127.0.0.3"), false)
         assert.is_false(b:getStatus().healthy)
-        --b:setAddressStatus(true, "127.0.0.2", 8000)
         b:setAddressStatus(b:findAddress("127.0.0.2", 8000, "127.0.0.2"), true)
         assert.is_true(b:getStatus().healthy)
       end)
@@ -342,14 +314,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         --  dns = client,
         --})
         b = new_balancer(algorithm)
-        b.getPeer = function(self)
-          -- we do not really need to get a peer, just touch all addresses to
-          -- potentially force DNS renewals
-          --for _, addr in ipairs(self.addresses) do
-          --  addr:getPeer()
-          --end
-          targets.resolve_targets(self.targets)
-        end
         add_target(b, "127.0.0.1", 8000, 100)  -- add 1 initial host
       end)
 
@@ -673,9 +637,8 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
           }, b:getStatus())
 
           -- switch to unavailable
-          --assert(b:setAddressStatus(false, "1.2.3.4", 8001, "arecord.tst"))
           assert(b:setAddressStatus(b:findAddress("1.2.3.4", 8001, "arecord.tst"), false))
-          --add_target(b, "arecord.tst", 8001, 25)
+          add_target(b, "arecord.tst", 8001, 25)
           assert.same({
             healthy = true,
             weight = {
@@ -1490,7 +1453,7 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
             { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 20 },
             { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 20 },
           })
-          b:getPeer()  -- touch all adresses to force dns renewal
+          targets.resolve_targets(b.targets)  -- touch all adresses to force dns renewal
           add_target(b, "srvrecord.tst", 8001, 99) -- add again to update nodeWeight
 
           assert.same({
@@ -1674,7 +1637,7 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
             { name = "srvrecord.tst", target = "1.1.1.1", port = 9000, weight = 20 },
             { name = "srvrecord.tst", target = "2.2.2.2", port = 9001, weight = 20 },
           })
-          b:getPeer()  -- touch all adresses to force dns renewal
+          targets.resolve_targets(b.targets)  -- touch all adresses to force dns renewal
           add_target(b, "srvrecord.tst", 8001, 99) -- add again to update nodeWeight
 
           assert.same({
@@ -1768,7 +1731,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         assert.equal("1.1.1.1", ip)
         assert.equal(2, port)
         assert.equal("konghq.com", hostname)
-        --assert.equal("userdata", type(handle.__udata))
         assert.not_nil(handle)
       end)
 
@@ -1785,7 +1747,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         assert.equal("1.2.3.4", ip)
         assert.equal(2, port)
         assert.equal("konghq.com", hostname)
-        --assert.equal("userdata", type(handle.__udata))
         assert.not_nil(handle)
       end)
 
@@ -1804,7 +1765,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         assert.equal("1.2.3.4", ip)
         assert.equal(2, port)
         assert.equal("getkong.org", hostname)
-        --assert.equal("userdata", type(handle.__udata))
         assert.not_nil(handle)
       end)
 
@@ -1818,7 +1778,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         assert.equal("1.2.3.4", ip)
         assert.equal(8000, port)
         assert.equal("getkong.org", hostname)
-        --assert.equal("userdata", type(handle.__udata))
         assert.not_nil(handle)
       end)
 
@@ -1829,7 +1788,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         assert.equal("4.3.2.1", ip)
         assert.equal(8000, port)
         assert.equal(nil, hostname)
-        --assert.equal("userdata", type(handle.__udata))
         assert.not_nil(handle)
       end)
 
@@ -1840,7 +1798,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
         assert.equal("[::1]", ip)
         assert.equal(8000, port)
         assert.equal(nil, hostname)
-        --assert.equal("userdata", type(handle.__udata))
         assert.not_nil(handle)
       end)
 
@@ -1943,11 +1900,8 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
 
           ngx.sleep(0.1)  -- wait a bit before retrying
         end
-
       end)
-
     end)
-
 
 
     describe("status:", function()
@@ -1964,7 +1918,6 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
       after_each(function()
         b = nil
       end)
-
 
 
       describe("reports DNS source", function()
@@ -2089,11 +2042,7 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
             },
           }, b:getStatus())
         end)
-
       end)
-
     end)
-
   end)
-
 end

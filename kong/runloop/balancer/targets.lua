@@ -43,7 +43,17 @@ local queryDns
 function targets_M.init()
   require("kong.tools.dns")(kong.configuration)    -- configure DNS client
   balancers = require "kong.runloop.balancer.balancers"
+  targets_M.start_resolve_timer()
+end
+
+local _resolve_timer_started
+function targets_M.start_resolve_timer()
+  if _resolve_timer_started then
+    return
+  end
+
   ngx.timer.every(1, resolve_timer_callback)
+  _resolve_timer_started = true
 end
 
 local _rtype_to_name
