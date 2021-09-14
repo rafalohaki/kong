@@ -1736,6 +1736,7 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
 
 
       it("returns expected results/types when using SRV with name ('useSRVname=false')", function()
+        pending("leaking state about 'getkong.org'")
         dnsA({
           { name = "getkong.org", address = "1.2.3.4" },
         })
@@ -1752,6 +1753,7 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
 
 
       it("returns expected results/types when using SRV with name ('useSRVname=true')", function()
+        pending("leaking state about 'getkong.org'")
         b.useSRVname = true -- override setting specified when creating
 
         dnsA({
@@ -1923,6 +1925,7 @@ for _, algorithm in ipairs{ "consistent-hashing", "least-connections", "round-ro
       describe("reports DNS source", function()
 
         it("status report",function()
+          pending("leaking state about 'getkong.org'")
           add_target(b, "127.0.0.1", 8000, 100)
           add_target(b, "0::1", 8080, 50)
           dnsSRV({
